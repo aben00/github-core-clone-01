@@ -1,20 +1,23 @@
-// Scenario identity: the trial's viewer login, derived from the contest's public
-// seeded scenario (kit program/env/src/wire.ts). The scenario is a pure function
-// of SCENARIO_SEED, so this process recomputes the same viewer the suite uses:
-// login "adaiversen", id 1000. No clock, no randomness — deterministic.
+// Scenario identity: the trial's viewer login, derived from the
+// contest's public seeded scenario (the kit's wire.ts). The scenario
+// is a pure function of SCENARIO_SEED, so this process recomputes
+// exactly the viewer the suite uses: login "adaiversen", id 1000.
+// No clock, no randomness anywhere — fully deterministic.
 
 const U64_MASK = 0xffffffffffffffffn;
 const SCENARIO_SEED = 0x6a09e667f3bcc909n;
 
+// FNV-1a over 64 bits, the scenario's string hash.
 function fnv1a64(text: string): bigint {
   let hash = 0xcbf29ce484222325n;
-  for (let i = 0; i < text.length; i += 1) {
-    hash ^= BigInt(text.charCodeAt(i));
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= BigInt(text.charCodeAt(index));
     hash = (hash * 0x100000001b3n) & U64_MASK;
   }
   return hash;
 }
 
+// SplitMix-style finaliser for a 64-bit value.
 function mix64(value: bigint): bigint {
   let z = (value + 0x9e3779b97f4a7c15n) & U64_MASK;
   z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & U64_MASK;
@@ -22,11 +25,12 @@ function mix64(value: bigint): bigint {
   return (z ^ (z >> 31n)) & U64_MASK;
 }
 
+// The seed for one named part of the scenario: seed XOR hash(label).
 function scenarioSeedFor(label: string): bigint {
   return mix64(SCENARIO_SEED ^ fnv1a64(label));
 }
 
-/** xorshift64*: the scenario's PRNG, seeded from a bigint. */
+// xorshift64*: the scenario's PRNG, seeded from a bigint.
 export class Rng {
   #state: bigint;
   constructor(seed: bigint) {
@@ -44,6 +48,8 @@ export class Rng {
   nextU32(): number {
     return Number(this.nextU64() >> 32n);
   }
+  // Uniform integer in [0, maxExclusive), rejection-sampled so the
+  // result is unbiased even when the range does not divide 2^32.
   nextInt(maxExclusive: number): number {
     if (maxExclusive === 1) return 0;
     const range = 4_294_967_296;
@@ -59,13 +65,60 @@ export class Rng {
 }
 
 const FIRST_NAMES: readonly string[] = [
-  'ada', 'bram', 'cora', 'dmitri', 'elena', 'felix', 'greta', 'hugo', 'iris', 'jonas', 'kira', 'lars',
-  'mira', 'nico', 'olga', 'pavel', 'quinn', 'rosa', 'sven', 'tess', 'ulla', 'vito', 'wren', 'yara', 'zane',
+  'ada',
+  'bram',
+  'cora',
+  'dmitri',
+  'elena',
+  'felix',
+  'greta',
+  'hugo',
+  'iris',
+  'jonas',
+  'kira',
+  'lars',
+  'mira',
+  'nico',
+  'olga',
+  'pavel',
+  'quinn',
+  'rosa',
+  'sven',
+  'tess',
+  'ulla',
+  'vito',
+  'wren',
+  'yara',
+  'zane',
 ];
+
 const LAST_NAMES: readonly string[] = [
-  'anders', 'bauer', 'costa', 'dahl', 'eriksen', 'fischer', 'garcia', 'holm', 'iversen', 'jansen', 'keller',
-  'lind', 'moreau', 'novak', 'olsen', 'peters', 'quist', 'rossi', 'sato', 'turi', 'ulrich', 'vega', 'weber',
-  'xu', 'yilmaz', 'zimmer',
+  'anders',
+  'bauer',
+  'costa',
+  'dahl',
+  'eriksen',
+  'fischer',
+  'garcia',
+  'holm',
+  'iversen',
+  'jansen',
+  'keller',
+  'lind',
+  'moreau',
+  'novak',
+  'olsen',
+  'peters',
+  'quist',
+  'rossi',
+  'sato',
+  'turi',
+  'ulrich',
+  'vega',
+  'weber',
+  'xu',
+  'yilmaz',
+  'zimmer',
 ];
 
 export interface ScenarioUser {
@@ -75,6 +128,8 @@ export interface ScenarioUser {
   email: string;
 }
 
+// Generate `count` users from `rng`, with unique logins. A login is
+// first+last; on a collision a numeric suffix is appended.
 function generateUsers(rng: Rng, count: number): ScenarioUser[] {
   const used = new Set<string>();
   const users: ScenarioUser[] = [];
@@ -94,12 +149,14 @@ function generateUsers(rng: Rng, count: number): ScenarioUser[] {
   return users;
 }
 
-/** The trial's viewer (users[0]), teammate and stranger, derived from the seed. */
+// The trial's viewer (users[0]), teammate and stranger, derived
+// from the seed. The suite derives the same three users the same way.
 export function scenarioUsers(): { viewer: ScenarioUser; teammate: ScenarioUser; stranger: ScenarioUser } {
   const users = generateUsers(new Rng(scenarioSeedFor('users')), 12);
   return { viewer: users[0], teammate: users[1], stranger: users[2] };
 }
 
-/** Fixed epoch for every timestamp this forge writes (deterministic across runs). */
+// Fixed epoch for every timestamp this forge writes, so two runs of
+// the same trial produce byte-identical state.
 export const FIXED_EPOCH_SEC = 1735689600;
 export const FIXED_ISO = '2025-01-01T00:00:00.000Z';
