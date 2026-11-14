@@ -1,5 +1,7 @@
-// GitHub REST v3: repositories, branches, commits, contents, labels, issues,
-// comments, pull requests. Shares the Store with git/GraphQL/MCP.
+// GitHub REST v3 surface: repositories, branches, commits, contents,
+// labels, issues, comments and pull requests. Everything here shares
+// one Store with the git, GraphQL and MCP surfaces, so a change made
+// through any one of them is visible through the others.
 
 import { Store, ApiError, parseCommit, parseTree, type Repo } from './store.ts';
 
@@ -18,10 +20,11 @@ export class RestHandler {
     this.expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   }
 
+  // Bearer token check. An empty expected token accepts any non-empty bearer.
   auth(headers: Record<string, string | undefined>): boolean {
-    const auth = headers['authorization'] ?? '';
-    if (!auth.startsWith('Bearer ')) return false;
-    const token = auth.slice('Bearer '.length);
+    const header = headers['authorization'] ?? '';
+    if (!header.startsWith('Bearer ')) return false;
+    const token = header.slice('Bearer '.length);
     if (token === '') return false;
     if (this.expectedToken !== '' && token !== this.expectedToken) return false;
     return true;
@@ -39,15 +42,16 @@ export class RestHandler {
     return this.ok(status, { message }, {});
   }
 
+  // Slice `items` to the requested page and build a Link rel="next" value.
   paginate<T>(items: T[], query: URLSearchParams, basePath: string, host: string): { page: T[]; link: string | null } {
     const perPage = Math.max(1, parseInt(query.get('per_page') ?? '30', 10) || 30);
-    const page = Math.max(1, parseInt(query.get('page') ?? '1', 10) || 1);
-    const start = (page - 1) * perPage;
+    const pageNo = Math.max(1, parseInt(query.get('page') ?? '1', 10) || 1);
+    const start = (pageNo - 1) * perPage;
     const slice = items.slice(start, start + perPage);
     let link: string | null = null;
     if (start + perPage < items.length) {
       const next = new URLSearchParams(query);
-      next.set('page', String(page + 1));
+      next.set('page', String(pageNo + 1));
       next.set('per_page', String(perPage));
       link = `<http://${host}${basePath}?${next.toString()}>; rel="next"`;
     }
@@ -75,12 +79,13 @@ export class RestHandler {
       }
       const segments = path.split('/').filter((s) => s !== '').map((s) => decodeURIComponent(s));
       return this.route(method, segments, query, body, host);
-    } catch (err) {
-      if (err instanceof ApiError) return this.err(err.status, err.message);
-      return this.err(500, err instanceof Error ? err.message : 'Internal error');
+    } catch (caught) {
+      if (caught instanceof ApiError) return this.err(caught.status, caught.message);
+      return this.err(500, caught instanceof Error ? caught.message : 'Internal error');
     }
   }
 
+  // A repo under any owner other than the token owner is a 404, never a 403.
   repoOr404(owner: string, name: string): Repo {
     if (owner !== this.store.viewer.login) throw new ApiError(404, 'Not Found');
     const repo = this.store.getRepo(owner, name);
@@ -89,7 +94,7 @@ export class RestHandler {
   }
 
   route(method: string, seg: string[], query: URLSearchParams, body: Record<string, unknown>, host: string): RestResult {
-    // Root and meta
+    // Root and meta endpoints.
     if (seg.length === 0) {
       if (method === 'GET') {
         return this.ok(200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit', repository_url: '/api/v3/repos/{owner}/{repo}' }, { 'x-oauth-scopes': 'repo, read:org' });
@@ -156,20 +161,20 @@ export class RestHandler {
         if (!tip) return this.ok(200, []);
         const chain = this.store.commitChain(tip);
         const items = chain.map((oid) => {
-          const c = parseCommit((this.store.object(oid) as { data: Buffer }).data);
+          const parsed = parseCommit((this.store.object(oid) as { data: Buffer }).data);
           return {
             sha: oid,
             node_id: `C_${oid}`,
             commit: {
-              message: c.message,
+              message: parsed.message,
               author: { name: this.store.viewer.name, email: this.store.viewer.email, date: '2025-01-01T00:00:00.000Z' },
               committer: { name: this.store.viewer.name, email: this.store.viewer.email, date: '2025-01-01T00:00:00.000Z' },
-              tree: { sha: c.tree },
+              tree: { sha: parsed.tree },
               url: `/api/v3/repos/${owner}/${repoName}/git/commits/${oid}`,
             },
             author: this.store.userJson(this.store.viewer),
             committer: this.store.userJson(this.store.viewer),
-            parents: c.parents.map((p) => ({ sha: p })),
+            parents: parsed.parents.map((p) => ({ sha: p })),
           };
         });
         const { page, link } = this.paginate(items, query, `/api/v3/repos/${owner}/${repoName}/commits`, host);
@@ -198,12 +203,12 @@ export class RestHandler {
           const refParam = query.get('ref');
           const tip = refParam ? this.store.resolveRef(repo, refParam) : repo.refs.get(`refs/heads/${repo.defaultBranch}`);
           if (!tip) throw new ApiError(404, 'Not Found');
-          const commit = this.store.commitOf(tip);
-          if (!commit) throw new ApiError(404, 'Not Found');
+          const parsed = this.store.commitOf(tip);
+          if (!parsed) throw new ApiError(404, 'Not Found');
           if (filePath === '') {
-            return this.ok(200, this.directoryEntries(repo, commit.tree, ''));
+            return this.ok(200, this.directoryEntries(repo, parsed.tree, ''));
           }
-          const blob = this.store.blobAt(commit.tree, filePath);
+          const blob = this.store.blobAt(parsed.tree, filePath);
           if (blob) {
             return this.ok(200, {
               type: 'file',
@@ -216,9 +221,9 @@ export class RestHandler {
               url: `/api/v3/repos/${owner}/${repoName}/contents/${filePath}`,
             });
           }
-          // Directory?
-          const dirEntries = this.directoryEntries(repo, commit.tree, filePath);
-          if (dirEntries !== null) return this.ok(200, dirEntries);
+          // Not a file — maybe a directory listing instead.
+          const entries = this.directoryEntries(repo, parsed.tree, filePath);
+          if (entries !== null) return this.ok(200, entries);
           throw new ApiError(404, 'Not Found');
         }
         if (method === 'DELETE') {
@@ -238,7 +243,7 @@ export class RestHandler {
           return this.ok(201, { name, color, description: '' });
         }
         if (method === 'GET') {
-          return this.ok(200, [...repo.labels.values()].map((l) => ({ name: l.name, color: l.color, description: '' })));
+          return this.ok(200, [...repo.labels.values()].map((label) => ({ name: label.name, color: label.color, description: '' })));
         }
         return this.err(404, 'Not Found');
       }
@@ -282,9 +287,9 @@ export class RestHandler {
         }
         if (rest[2] === 'comments') {
           if (method === 'POST') {
-            const b = body['body'];
-            if (typeof b !== 'string') return this.err(422, 'body is required');
-            const comment = this.store.addComment(issue, b);
+            const text = body['body'];
+            if (typeof text !== 'string') return this.err(422, 'body is required');
+            const comment = this.store.addComment(issue, text);
             return this.ok(201, { id: comment.id, node_id: comment.gqlId, body: comment.body, user: this.store.userJson(this.store.viewer), created_at: '2025-01-01T00:00:00.000Z', updated_at: '2025-01-01T00:00:00.000Z' });
           }
           if (method === 'GET') {
@@ -309,7 +314,7 @@ export class RestHandler {
             const state = query.get('state');
             let pulls = repo.pulls;
             if (state === 'all') {
-              // keep all
+              // Keep every pull request, open or merged.
             } else if (state === 'closed') {
               pulls = pulls.filter((p) => p.state === 'closed');
             } else {
@@ -373,7 +378,7 @@ export class RestHandler {
     if (method === 'GET') {
       const prefix = rest.length === 0 ? 'refs/' : `refs/${rest.join('/')}`;
       const matches = [...repo.refs.entries()].filter(([ref]) => ref === prefix || ref.startsWith(prefix.endsWith('/') ? prefix : `${prefix}/`) || (rest.length > 0 && ref === `refs/${rest.join('/')}`));
-      // Exact single ref?
+      // A single exact ref answers as one object, not a list.
       const exact = repo.refs.get(`refs/${rest.join('/')}`);
       if (rest.length > 0 && exact !== undefined) {
         const ref = `refs/${rest.join('/')}`;
@@ -388,7 +393,7 @@ export class RestHandler {
     return this.err(404, 'Not Found');
   }
 
-  /** Entries of the tree at `dirPath` ('' = root). Null when the path is not a directory. */
+  // Entries of the tree at `dirPath` ('' means the root). Null when the path is not a directory.
   directoryEntries(repo: Repo, treeOid: string, dirPath: string): Record<string, unknown>[] | null {
     let current = treeOid;
     if (dirPath !== '') {
@@ -406,13 +411,14 @@ export class RestHandler {
     return parseTree(obj.data).map((e) => {
       const isDir = e.mode === '40000';
       const blob = !isDir ? this.store.object(e.oid) : undefined;
+      const entryPath = dirPath === '' ? e.name : `${dirPath}/${e.name}`;
       return {
         type: isDir ? 'dir' : 'file',
         name: e.name,
-        path: dirPath === '' ? e.name : `${dirPath}/${e.name}`,
+        path: entryPath,
         sha: e.oid,
         size: blob ? blob.data.length : 0,
-        url: `/api/v3/repos/${repo.owner}/${repo.name}/contents/${dirPath === '' ? e.name : `${dirPath}/${e.name}`}`,
+        url: `/api/v3/repos/${repo.owner}/${repo.name}/contents/${entryPath}`,
       };
     });
   }
