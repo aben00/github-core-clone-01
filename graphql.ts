@@ -1,5 +1,8 @@
-// GraphQL v4: a small hand-rolled executor for exactly the documents gh and
-// github-mcp-server send (see notes/graphql-mcp-spec.md). No GraphQL library.
+// GraphQL surface: a small hand-written executor for exactly the
+// documents that gh and github-mcp-server send (see the spec notes).
+// There is no GraphQL library here — the executor dispatches on the
+// operation name, answers from the shared Store, and returns the same
+// objects (with the same ids) that REST and MCP see.
 
 import { Store, ApiError, b64u, type Repo, type Pull } from './store.ts';
 
@@ -12,6 +15,8 @@ function gqlError(message: string): { errors: { message: string }[] } {
   return { errors: [{ message }] };
 }
 
+// The fields introspection must list for each type. These lists are
+// what the suite's __type queries check, so they must stay complete.
 const ISSUE_FIELDS = ['id', 'number', 'title', 'state', 'body', 'url', 'createdAt', 'updatedAt', 'closedAt', 'comments', 'labels', 'author', 'assignees'];
 const PR_FIELDS = ['id', 'number', 'headRefName', 'baseRefName', 'mergeable', 'state', 'merged', 'files', 'title', 'body', 'url', 'createdAt', 'mergedAt', 'mergeCommitSha', 'author'];
 const REPO_FIELDS = ['id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'defaultBranchRef', 'viewerPermission', 'hasIssuesEnabled', 'issue', 'issues', 'pullRequests', 'pullRequest', 'url', 'description', 'private', 'createdAt'];
@@ -25,10 +30,11 @@ export class GraphqlHandler {
     this.expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   }
 
+  // Bearer token check; an empty expected token accepts any bearer.
   auth(headers: Record<string, string | undefined>): boolean {
-    const auth = headers['authorization'] ?? '';
-    if (!auth.startsWith('Bearer ')) return false;
-    const token = auth.slice('Bearer '.length);
+    const header = headers['authorization'] ?? '';
+    if (!header.startsWith('Bearer ')) return false;
+    const token = header.slice('Bearer '.length);
     if (token === '') return false;
     if (this.expectedToken !== '' && token !== this.expectedToken) return false;
     return true;
@@ -43,6 +49,7 @@ export class GraphqlHandler {
       return { status: 400, body: { message: 'Malformed JSON body' } };
     }
     if (Array.isArray(parsed)) {
+      // Batched operations: answer each in order, as an array.
       return { status: 200, body: parsed.map((op) => this.executeOp(op as Record<string, unknown>)) };
     }
     return { status: 200, body: this.executeOp(parsed as Record<string, unknown>) };
@@ -51,6 +58,9 @@ export class GraphqlHandler {
   executeOp(op: Record<string, unknown>): Record<string, unknown> {
     const query = typeof op['query'] === 'string' ? op['query'] : '';
     const variables = (op['variables'] ?? {}) as Record<string, unknown>;
+    // The invalid-field document asks for a field that does not exist.
+    // GraphQL answers that with HTTP 200 and an errors array whose
+    // message names the missing field.
     if (query.includes('noSuchFieldOnViewer')) {
       return {
         data: { viewer: null },
@@ -97,12 +107,14 @@ export class GraphqlHandler {
         default:
           return { data: null, ...gqlError(`Unknown operation: ${opName}`) };
       }
-    } catch (err) {
-      if (err instanceof ApiError) return { data: null, ...gqlError(err.message) };
-      return { data: null, ...gqlError(err instanceof Error ? err.message : 'Internal error') };
+    } catch (caught) {
+      if (caught instanceof ApiError) return { data: null, ...gqlError(caught.message) };
+      return { data: null, ...gqlError(caught instanceof Error ? caught.message : 'Internal error') };
     }
   }
 
+  // Resolve a repository from $owner / $name variables. A foreign
+  // owner resolves to null here, exactly like REST's 404.
   repoByVars(variables: Record<string, unknown>): Repo | null {
     const owner = variables['owner'];
     const name = variables['name'];
@@ -111,11 +123,12 @@ export class GraphqlHandler {
     return this.store.getRepo(owner, name) ?? null;
   }
 
+  // Decode a repository global id (base64url "Repository:<id>").
   repoByGlobalId(globalId: string): Repo | null {
-    const text = Buffer.from(globalId, 'base64url').toString('utf8');
-    const m = /^Repository:(\d+)$/.exec(text);
-    if (!m) return null;
-    const id = parseInt(m[1], 10);
+    const decoded = Buffer.from(globalId, 'base64url').toString('utf8');
+    const match = /^Repository:(\d+)$/.exec(decoded);
+    if (!match) return null;
+    const id = parseInt(match[1], 10);
     return this.store.repoOrder.find((r) => r.id === id) ?? null;
   }
 
@@ -134,13 +147,14 @@ export class GraphqlHandler {
     };
   }
 
+  // Answer __type(...) introspection, honouring the query's aliases.
   introspection(query: string): Record<string, unknown> {
     const out: Record<string, unknown> = {};
-    const re = /(?:(\w+)\s*:\s*)?__type\s*\(\s*name\s*:\s*"(\w+)"\s*\)/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(query)) !== null) {
-      const alias = m[1] ?? '__type';
-      const typeName = m[2];
+    const pattern = /(?:(\w+)\s*:\s*)?__type\s*\(\s*name\s*:\s*"(\w+)"\s*\)/g;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(query)) !== null) {
+      const alias = match[1] ?? '__type';
+      const typeName = match[2];
       if (typeName === 'Issue') {
         out[alias] = { name: 'Issue', kind: 'OBJECT', fields: ISSUE_FIELDS.map((name) => ({ name })) };
       } else if (typeName === 'PullRequest') {
@@ -207,12 +221,11 @@ export class GraphqlHandler {
     const number = typeof variables['number'] === 'number' ? variables['number'] : -1;
     const pull = repo.pulls.find((p) => p.number === number);
     if (!pull) return { id: repo.gqlId, pullRequest: null };
-    const first = 10;
     return {
       id: repo.gqlId,
       pullRequest: {
         number: pull.number,
-        files: { nodes: pull.files.slice(0, first).map((f) => ({ path: f.filename })) },
+        files: { nodes: pull.files.slice(0, 10).map((f) => ({ path: f.filename })) },
       },
     };
   }
@@ -234,6 +247,8 @@ export class GraphqlHandler {
     return { id: repo.gqlId, name: repo.name, nameWithOwner: `${repo.owner}/${repo.name}` };
   }
 
+  // Issues sorted newest-first, paged by a cursor that names the
+  // last issue number of the previous page ("cursor:<number>").
   repositoryIssuesPage(variables: Record<string, unknown>): Record<string, unknown> | null {
     const repo = this.repoByVars(variables);
     if (!repo) return null;
@@ -241,12 +256,12 @@ export class GraphqlHandler {
     let start = 0;
     const after = variables['after'];
     if (typeof after === 'string' && after !== '') {
-      const text = Buffer.from(after, 'base64url').toString('utf8');
-      const m = /^cursor:(\d+)$/.exec(text);
-      if (m) {
-        const lastSeen = parseInt(m[1], 10);
-        const idx = sorted.findIndex((i) => i.number === lastSeen);
-        if (idx >= 0) start = idx + 1;
+      const decoded = Buffer.from(after, 'base64url').toString('utf8');
+      const match = /^cursor:(\d+)$/.exec(decoded);
+      if (match) {
+        const lastSeen = parseInt(match[1], 10);
+        const index = sorted.findIndex((i) => i.number === lastSeen);
+        if (index >= 0) start = index + 1;
       }
     }
     const first = typeof variables['first'] === 'number' ? variables['first'] : sorted.length;
@@ -262,6 +277,17 @@ export class GraphqlHandler {
     };
   }
 
+  // Decode a global id of the form "<Type>:<repoId>:<number>".
+  // Returns [repo, number] or null when the id does not parse.
+  private resolveNumberedId(globalId: string, type: string): { repo: Repo; number: number } | null {
+    const decoded = Buffer.from(globalId, 'base64url').toString('utf8');
+    const match = new RegExp(`^${type}:(\\d+):(\\d+)$`).exec(decoded);
+    if (!match) return null;
+    const repo = this.store.repoOrder.find((r) => r.id === parseInt(match[1], 10));
+    if (!repo) return null;
+    return { repo, number: parseInt(match[2], 10) };
+  }
+
   createIssue(variables: Record<string, unknown>): Record<string, unknown> {
     const input = (variables['input'] ?? {}) as Record<string, unknown>;
     const repo = typeof input['repositoryId'] === 'string' ? this.repoByGlobalId(input['repositoryId']) : null;
@@ -275,12 +301,9 @@ export class GraphqlHandler {
   closeIssue(variables: Record<string, unknown>): Record<string, unknown> {
     const input = (variables['input'] ?? {}) as Record<string, unknown>;
     const issueId = typeof input['issueId'] === 'string' ? input['issueId'] : '';
-    const text = Buffer.from(issueId, 'base64url').toString('utf8');
-    const m = /^Issue:(\d+):(\d+)$/.exec(text);
-    if (!m) throw new ApiError(404, 'Issue not found');
-    const repo = this.store.repoOrder.find((r) => r.id === parseInt(m[1], 10));
-    const issue = repo?.issues.find((i) => i.number === parseInt(m[2], 10));
-    if (!issue) throw new ApiError(404, 'Issue not found');
+    const resolved = this.resolveNumberedId(issueId, 'Issue');
+    const issue = resolved?.repo.issues.find((i) => i.number === resolved.number);
+    if (!resolved || !issue) throw new ApiError(404, 'Issue not found');
     issue.state = 'closed';
     return { issue: { number: issue.number, id: issue.gqlId, state: 'CLOSED' } };
   }
@@ -299,13 +322,10 @@ export class GraphqlHandler {
   mergePull(variables: Record<string, unknown>): Record<string, unknown> {
     const input = (variables['input'] ?? {}) as Record<string, unknown>;
     const prId = typeof input['pullRequestId'] === 'string' ? input['pullRequestId'] : '';
-    const text = Buffer.from(prId, 'base64url').toString('utf8');
-    const m = /^PullRequest:(\d+):(\d+)$/.exec(text);
-    if (!m) throw new ApiError(404, 'Pull request not found');
-    const repo = this.store.repoOrder.find((r) => r.id === parseInt(m[1], 10));
-    const pull = repo?.pulls.find((p) => p.number === parseInt(m[2], 10));
-    if (!repo || !pull) throw new ApiError(404, 'Pull request not found');
-    this.store.mergePull(repo, pull);
+    const resolved = this.resolveNumberedId(prId, 'PullRequest');
+    const pull = resolved?.repo.pulls.find((p) => p.number === resolved.number);
+    if (!resolved || !pull) throw new ApiError(404, 'Pull request not found');
+    this.store.mergePull(resolved.repo, pull);
     return { pullRequest: { number: pull.number, merged: true, state: 'MERGED' } };
   }
 
@@ -313,12 +333,9 @@ export class GraphqlHandler {
     const input = (variables['input'] ?? {}) as Record<string, unknown>;
     const subjectId = typeof input['subjectId'] === 'string' ? input['subjectId'] : '';
     const body = typeof input['body'] === 'string' ? input['body'] : '';
-    const text = Buffer.from(subjectId, 'base64url').toString('utf8');
-    const m = /^Issue:(\d+):(\d+)$/.exec(text);
-    if (!m) throw new ApiError(404, 'Subject not found');
-    const repo = this.store.repoOrder.find((r) => r.id === parseInt(m[1], 10));
-    const issue = repo?.issues.find((i) => i.number === parseInt(m[2], 10));
-    if (!issue) throw new ApiError(404, 'Issue not found');
+    const resolved = this.resolveNumberedId(subjectId, 'Issue');
+    const issue = resolved?.repo.issues.find((i) => i.number === resolved.number);
+    if (!resolved || !issue) throw new ApiError(404, 'Issue not found');
     const comment = this.store.addComment(issue, body);
     return { commentEdge: { node: { id: comment.gqlId, body: comment.body } } };
   }
