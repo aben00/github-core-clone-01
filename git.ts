@@ -286,6 +286,8 @@ export interface FetchPlan {
   shallow: string[];
   /** Old shallow boundaries that are no longer boundaries. */
   unshallow: string[];
+  /** Objects the client already holds: never re-send them. */
+  heldObjects: Set<string>;
 }
 
 /**
@@ -299,11 +301,13 @@ export function planFetch(
   clientShallow: string[],
   deepen: number | null,
 ): FetchPlan {
-  const haveCommits = new Set<string>();
-  for (const h of haves) {
-    for (const c of store.commitChain(h)) haveCommits.add(c);
-    haveCommits.add(h);
-  }
+  // What the client already holds: the haves plus their tree closures, but
+  // the walk stops at shallow boundaries — a shallow clone holds its boundary
+  // commit and its tree, not the boundary's parents (that is what deepen is
+  // for). The same set drives both the commit-inclusion walk and the pack's
+  // object filter, so a fetch never re-sends an object the client has.
+  const held = store.reachableObjects(haves, new Set(clientShallow));
+  const haveCommits = held.commits;
   const included = new Map<string, number>(); // commit oid -> depth (want depth 1)
   const extras: string[] = [];
   const queue: { oid: string; depth: number }[] = [];
@@ -371,17 +375,23 @@ export function planFetch(
   }
   // Closure of included commits: commits + their trees/blobs (+ tag targets).
   const commits = [...included.keys()];
-  return { commits, extras, shallow, unshallow };
+  return { commits, extras, shallow, unshallow, heldObjects: held.objects };
 }
 
-/** All objects (as pack entries) for the fetch plan, in a stable order. */
+/** All objects (as pack entries) for the fetch plan, in a stable order.
+ *  Objects the client already holds (plan.heldObjects) are left out: a
+ *  re-sent tree or blob fails the incremental-fetch checks. A held tree's
+ *  whole subtree is held too (same oid, same content), so it is skipped
+ *  without descending. */
 export function collectFetchObjects(store: Store, plan: FetchPlan): ParsedPackObject[] {
   const wanted = new Map<string, ParsedPackObject>();
   const addObject = (oid: string): void => {
+    if (plan.heldObjects.has(oid)) return;
     const o = store.object(oid);
     if (o && !wanted.has(oid)) wanted.set(oid, { oid, type: o.type, data: o.data });
   };
   const addTree = (treeOid: string): void => {
+    if (plan.heldObjects.has(treeOid)) return;
     const o = store.object(treeOid);
     if (!o || o.type !== 'tree') return;
     addObject(treeOid);

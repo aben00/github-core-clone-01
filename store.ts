@@ -235,6 +235,39 @@ export class Store {
     return chain.includes(maybeAncestor);
   }
 
+  /**
+   * Every object a client holding `tips` already has: the tips themselves plus
+   * each tip's tree closure (trees and blobs). The walk stops at `stopAt`
+   * commits — a shallow boundary is held, together with its tree, but its
+   * parents are not. Returns the visited commits and the full object set.
+   */
+  reachableObjects(tips: string[], stopAt: Set<string>): { commits: Set<string>; objects: Set<string> } {
+    const commits = new Set<string>();
+    const objects = new Set<string>();
+    const addTree = (treeOid: string): void => {
+      const o = this.objects.get(treeOid);
+      if (!o || o.type !== 'tree' || objects.has(treeOid)) return;
+      objects.add(treeOid);
+      for (const e of parseTree(o.data)) {
+        if (e.mode === '40000') addTree(e.oid);
+        else if (e.mode !== '160000') objects.add(e.oid);
+      }
+    };
+    const stack = [...tips];
+    while (stack.length > 0) {
+      const oid = stack.pop() as string;
+      if (commits.has(oid)) continue;
+      const commit = this.commitOf(oid);
+      if (!commit) continue;
+      commits.add(oid);
+      objects.add(oid);
+      addTree(commit.tree);
+      if (stopAt.has(oid)) continue;
+      for (const p of commit.parents) stack.push(p);
+    }
+    return { commits, objects };
+  }
+
   /** Nearest common ancestor of a and b (BFS from a). Null when unrelated. */
   mergeBase(a: string, b: string): string | null {
     const bAncestors = new Set(this.commitChain(b));
