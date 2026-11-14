@@ -1,6 +1,10 @@
-// MCP over streamable HTTP (JSON-RPC 2.0): both the modern 2026-07-28 era
-// (server/discover) and the legacy handshake era (initialize +
-// notifications/initialized). Shares the Store with REST/GraphQL.
+// MCP over streamable HTTP (JSON-RPC 2.0). Two eras are supported
+// side by side: the modern 2026-07-28 era, where the client probes
+// server/discover first, and the legacy handshake era, where it sends
+// initialize and then notifications/initialized. Both eras share the
+// same Store as REST and GraphQL, so a repository or issue created
+// through a tool is immediately visible through the other surfaces,
+// with the same ids.
 
 import { Store, ApiError } from './store.ts';
 
@@ -16,6 +20,10 @@ interface ToolDef {
   inputSchema: Record<string, unknown>;
 }
 
+// The six tools the suite requires, with the documented argument
+// names exactly as the suite sends them. The suite maps its own
+// names onto these schema properties by normalised-name synonyms,
+// so the documented names must be used here, not aliases.
 const TOOLS: ToolDef[] = [
   {
     name: 'create_repo',
@@ -23,9 +31,18 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'The repository name.' },
-        description: { type: 'string', description: 'A short description of the repository.' },
-        private: { type: 'boolean', description: 'Whether the repository is private.' },
+        name: {
+          type: 'string',
+          description: 'The repository name.',
+        },
+        description: {
+          type: 'string',
+          description: 'A short description of the repository.',
+        },
+        private: {
+          type: 'boolean',
+          description: 'Whether the repository is private.',
+        },
       },
       required: ['name'],
     },
@@ -36,8 +53,14 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
-        repo: { type: 'string', description: 'The repository name.' },
+        owner: {
+          type: 'string',
+          description: 'The repository owner login.',
+        },
+        repo: {
+          type: 'string',
+          description: 'The repository name.',
+        },
       },
       required: ['owner', 'repo'],
     },
@@ -48,10 +71,22 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
-        repo: { type: 'string', description: 'The repository name.' },
-        title: { type: 'string', description: 'The issue title.' },
-        body: { type: 'string', description: 'The issue body.' },
+        owner: {
+          type: 'string',
+          description: 'The repository owner login.',
+        },
+        repo: {
+          type: 'string',
+          description: 'The repository name.',
+        },
+        title: {
+          type: 'string',
+          description: 'The issue title.',
+        },
+        body: {
+          type: 'string',
+          description: 'The issue body.',
+        },
       },
       required: ['owner', 'repo', 'title'],
     },
@@ -62,9 +97,18 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
-        repo: { type: 'string', description: 'The repository name.' },
-        state: { type: 'string', description: 'Issue state: open, closed or all.' },
+        owner: {
+          type: 'string',
+          description: 'The repository owner login.',
+        },
+        repo: {
+          type: 'string',
+          description: 'The repository name.',
+        },
+        state: {
+          type: 'string',
+          description: 'Issue state: open, closed or all.',
+        },
       },
       required: ['owner', 'repo'],
     },
@@ -75,12 +119,30 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
-        repo: { type: 'string', description: 'The repository name.' },
-        title: { type: 'string', description: 'The pull request title.' },
-        head: { type: 'string', description: 'The head branch name.' },
-        base: { type: 'string', description: 'The base branch name.' },
-        body: { type: 'string', description: 'The pull request body.' },
+        owner: {
+          type: 'string',
+          description: 'The repository owner login.',
+        },
+        repo: {
+          type: 'string',
+          description: 'The repository name.',
+        },
+        title: {
+          type: 'string',
+          description: 'The pull request title.',
+        },
+        head: {
+          type: 'string',
+          description: 'The head branch name.',
+        },
+        base: {
+          type: 'string',
+          description: 'The base branch name.',
+        },
+        body: {
+          type: 'string',
+          description: 'The pull request body.',
+        },
       },
       required: ['owner', 'repo', 'title', 'head', 'base'],
     },
@@ -91,16 +153,26 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
-        repo: { type: 'string', description: 'The repository name.' },
-        pull_number: { type: 'integer', description: 'The pull request number.' },
+        owner: {
+          type: 'string',
+          description: 'The repository owner login.',
+        },
+        repo: {
+          type: 'string',
+          description: 'The repository name.',
+        },
+        pull_number: {
+          type: 'integer',
+          description: 'The pull request number.',
+        },
       },
       required: ['owner', 'repo', 'pull_number'],
     },
   },
 ];
 
-// The tools list is built once: two tools/list calls answer byte for byte.
+// The tools list is serialised once and reused verbatim: two
+// consecutive tools/list answers must be byte-for-byte identical.
 const TOOLS_LIST_JSON = JSON.stringify({ tools: TOOLS });
 
 export class McpHandler {
@@ -112,19 +184,20 @@ export class McpHandler {
     this.expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   }
 
+  // Bearer token check; an empty expected token accepts any bearer.
   auth(headers: Record<string, string | undefined>): boolean {
-    const auth = headers['authorization'] ?? '';
-    if (!auth.startsWith('Bearer ')) return false;
-    const token = auth.slice('Bearer '.length);
+    const header = headers['authorization'] ?? '';
+    if (!header.startsWith('Bearer ')) return false;
+    const token = header.slice('Bearer '.length);
     if (token === '') return false;
     if (this.expectedToken !== '' && token !== this.expectedToken) return false;
     return true;
   }
 
   rpcError(id: unknown, code: number, message: string, data?: unknown): Record<string, unknown> {
-    const err: Record<string, unknown> = { code, message };
-    if (data !== undefined) err['data'] = data;
-    return { jsonrpc: '2.0', id: id ?? null, error: err };
+    const error: Record<string, unknown> = { code, message };
+    if (data !== undefined) error['data'] = data;
+    return { jsonrpc: '2.0', id: id ?? null, error };
   }
 
   rpcResult(id: unknown, result: unknown): Record<string, unknown> {
@@ -132,7 +205,8 @@ export class McpHandler {
   }
 
   handle(method: string, headers: Record<string, string | undefined>, bodyText: string): McpResult {
-    // Notifications have no id and get 202 with no body.
+    // Auth is decided before anything else: even an unknown tool
+    // answers 401 when the token is missing or wrong.
     if (!this.auth(headers)) {
       return { status: 401, body: { message: 'Requires authentication' } };
     }
@@ -145,13 +219,14 @@ export class McpHandler {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return { status: 400, body: this.rpcError(null, -32700, 'Parse error') };
     }
-    const req = parsed as Record<string, unknown>;
-    const id = req['id'] ?? null;
-    const rpcMethod = typeof req['method'] === 'string' ? req['method'] : '';
+    const request = parsed as Record<string, unknown>;
+    const id = request['id'] ?? null;
+    const rpcMethod = typeof request['method'] === 'string' ? request['method'] : '';
+    // Notifications carry no id and are answered with 202 and no body.
     if (rpcMethod === 'notifications/initialized' || rpcMethod.startsWith('notifications/')) {
       return { status: 202, body: null };
     }
-    const params = (req['params'] ?? {}) as Record<string, unknown>;
+    const params = (request['params'] ?? {}) as Record<string, unknown>;
     switch (rpcMethod) {
       case 'server/discover': {
         const result: Record<string, unknown> = {
@@ -187,7 +262,8 @@ export class McpHandler {
     }
   }
 
-  /** Resolve owner/repo from arguments, accepting a full_name fallback. */
+  // Resolve owner/repo from tool arguments, accepting a "owner/repo"
+  // full_name as a fallback when owner or repo is missing.
   repoFromArgs(args: Record<string, unknown>): { owner: string; repo: string } | null {
     let owner = typeof args['owner'] === 'string' ? args['owner'] : '';
     let repo = typeof args['repo'] === 'string' ? args['repo'] : '';
@@ -205,13 +281,17 @@ export class McpHandler {
   callTool(id: unknown, params: Record<string, unknown>): Record<string, unknown> {
     const name = typeof params['name'] === 'string' ? params['name'] : '';
     const args = (params['arguments'] ?? {}) as Record<string, unknown>;
-    // Accept a server prefix (github__create_issue): match by suffix.
-    const canonical = TOOLS.find((t) => {
-      const n = name.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const c = t.name.toLowerCase().replace(/[^a-z0-9]/g, '');
-      return n === c || n.endsWith(c);
+    // Accept a server prefix such as github__create_issue: match by
+    // suffix after normalising away every non-alphanumeric character.
+    const canonical = TOOLS.find((tool) => {
+      const wanted = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const candidate = tool.name.toLowerCase().replace(/[^a-z0-9]/g, '');
+      return wanted === candidate || wanted.endsWith(candidate);
     });
     if (!canonical) return this.rpcError(id, -32602, `Unknown tool: ${name}`);
+    // A successful tool call returns both a text content block (a JSON
+    // string of the result) and the same result as structuredContent,
+    // so the suite finds the fields whichever place it looks.
     const toolResult = (obj: Record<string, unknown>): Record<string, unknown> => ({
       content: [{ type: 'text', text: JSON.stringify(obj) }],
       structuredContent: obj,
@@ -292,9 +372,9 @@ export class McpHandler {
         default:
           return this.rpcError(id, -32602, `Unknown tool: ${name}`);
       }
-    } catch (err) {
-      if (err instanceof ApiError) return this.rpcResult(id, toolError(err.message));
-      return this.rpcResult(id, toolError(err instanceof Error ? err.message : 'Internal error'));
+    } catch (caught) {
+      if (caught instanceof ApiError) return this.rpcResult(id, toolError(caught.message));
+      return this.rpcResult(id, toolError(caught instanceof Error ? caught.message : 'Internal error'));
     }
   }
 }
