@@ -91,11 +91,52 @@ function decodeObjectHeader(buf: Buffer, offset: number): { typeCode: number; si
   return { typeCode, size, next: cursor };
 }
 
+// Adler-32 of `data` — the checksum a zlib stream ends with. Written
+// fresh here for speed: it pins a stream's end in one scan, so a pack
+// entry no longer needs a binary search of inflate calls to find it.
+function adler32(data: Uint8Array): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + data[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
 // Find the smallest end E in (start, limit] such that inflating
 // buf[start:E] succeeds and yields exactly `declaredSize` bytes.
 // The zlib stream has no length prefix, so binary search is the
 // way to locate its end without guessing.
 function locateZlibEnd(buf: Buffer, start: number, limit: number, declaredSize: number): number {
+  // Fast path: Node's inflateSync ignores bytes after the first zlib
+  // stream, so one call yields the entry's payload from `start`. The
+  // stream's last four bytes are the Adler-32 of that payload, which
+  // locates its end. Verified by re-inflating the candidate slice; any
+  // doubt falls through to the binary search below.
+  try {
+    const payload = inflateSync(buf.subarray(start, limit), { maxOutputLength: declaredSize });
+    if (payload.length === declaredSize) {
+      const sum = adler32(payload);
+      const scanEnd = Math.min(limit, start + declaredSize + 64);
+      for (let i = start; i + 4 <= scanEnd; i += 1) {
+        if (buf[i] === (sum >>> 24) && buf[i + 1] === ((sum >>> 16) & 255) && buf[i + 2] === ((sum >>> 8) & 255) && buf[i + 3] === (sum & 255)) {
+          const cand = i + 4;
+          try {
+            const check = inflateSync(buf.subarray(start, cand));
+            if (check.length === declaredSize) return cand;
+          } catch {
+            // Not the real end: a coincidental checksum match inside the
+            // stream. Fall through to the binary search.
+          }
+          break;
+        }
+      }
+    }
+  } catch {
+    // Not a complete stream from `start`, or the payload is longer than
+    // declared: the binary search below reports the exact failure.
+  }
   let lo = start + 1;
   let hi = limit;
   let found = -1;
@@ -289,7 +330,10 @@ export function buildPack(objects: ParsedPackObject[]): Buffer {
       headerBytes.push(nextByte);
     }
     parts.push(Buffer.from(headerBytes));
-    parts.push(deflateSync(obj.data));
+    // Level 1: packs are built for the wire, not for disk, and clients
+    // inflate any valid level. The fastest level is plenty for objects
+    // this small and cuts clone time.
+    parts.push(deflateSync(obj.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();

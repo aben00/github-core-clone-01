@@ -14,8 +14,9 @@ export function sha1Hex(data: Buffer): string {
 }
 
 export function gitObjectId(type: string, data: Buffer): string {
+  // Two updates instead of a concat: avoids copying the object bytes.
   const head = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return sha1Hex(Buffer.concat([head, data]));
+  return createHash('sha1').update(head).update(data).digest('hex');
 }
 
 export function b64u(text: string): string {
@@ -198,6 +199,12 @@ export class Store {
   nextIssueRestId = 1;
   nextCommentId = 1;
   private counter = 0;
+  // Append-only caches. Git objects are immutable, so a parsed commit and
+  // a tip's ancestry never change once stored: memoizing them removes a
+  // full re-walk of the commit chain on every push's fast-forward check.
+  private readonly commitCache = new Map<string, ParsedCommit>();
+  private readonly chainCache = new Map<string, string[]>();
+  private readonly userJsonCache = new Map<string, Record<string, unknown>>();
 
   constructor() {
     const people = scenarioUsers();
@@ -224,13 +231,19 @@ export class Store {
   }
 
   commitOf(oid: string): ParsedCommit | null {
+    const cached = this.commitCache.get(oid);
+    if (cached) return cached;
     const found = this.objects.get(oid);
     if (!found || found.type !== 'commit') return null;
-    return parseCommit(found.data);
+    const parsed = parseCommit(found.data);
+    this.commitCache.set(oid, parsed);
+    return parsed;
   }
 
   // Every commit reachable from `tip` by following parents, newest first.
   commitChain(tip: string): string[] {
+    const cached = this.chainCache.get(tip);
+    if (cached) return cached;
     const visited = new Set<string>();
     const chain: string[] = [];
     const pending: string[] = [tip];
@@ -243,6 +256,7 @@ export class Store {
       chain.push(oid);
       for (let k = parsed.parents.length - 1; k >= 0; k -= 1) pending.push(parsed.parents[k]);
     }
+    this.chainCache.set(tip, chain);
     return chain;
   }
 
@@ -624,7 +638,13 @@ export class Store {
 
   // ---- JSON shapes ---------------------------------------------------
   userJson(user: ScenarioUser): Record<string, unknown> {
-    return { login: user.login, id: user.id, node_id: b64u(`User:${user.id}`), avatar_url: '', type: 'User', site_admin: false, name: user.name, email: user.email };
+    // Only three scenario users exist and their fields never change, so the
+    // rendered shape is cached per login (saves two base64 encodes per call).
+    const cached = this.userJsonCache.get(user.login);
+    if (cached) return cached;
+    const built = { login: user.login, id: user.id, node_id: b64u(`User:${user.id}`), avatar_url: '', type: 'User', site_admin: false, name: user.name, email: user.email };
+    this.userJsonCache.set(user.login, built);
+    return built;
   }
 
   repoJson(repo: Repo): Record<string, unknown> {

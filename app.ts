@@ -15,9 +15,11 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 // Answer one request with a JSON body. Extra `headers` are sent
 // beside the JSON content-type and content-length headers.
 function replyJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+  // Encode once: the Buffer gives both the wire bytes and their length,
+  // instead of one UTF-8 pass for the length and a second to send it.
+  const bytes = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': bytes.length, ...headers });
+  res.end(bytes);
 }
 
 // Answer with an empty body (used for 204 and for 202 notifications).
@@ -34,10 +36,19 @@ function replyRaw(res: ServerResponse, status: number, body: Buffer, contentType
 }
 
 // Split a request URL into its path and its raw query string.
+// Request targets here are always origin-form paths, so splitting on
+// the first '?' is exact and avoids a full URL parse per request.
 function splitPathAndQuery(req: IncomingMessage): { path: string; query: string } {
   try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    return { path: url.pathname, query: url.search.slice(1) };
+    const raw = req.url ?? '/';
+    // Absolute-form targets (rare, proxy-style) still go through URL.
+    if (raw.startsWith('http://') || raw.startsWith('https://')) {
+      const url = new URL(raw);
+      return { path: url.pathname, query: url.search.slice(1) };
+    }
+    const q = raw.indexOf('?');
+    if (q < 0) return { path: raw, query: '' };
+    return { path: raw.slice(0, q), query: raw.slice(q + 1) };
   } catch {
     return { path: '/', query: '' };
   }
@@ -45,6 +56,11 @@ function splitPathAndQuery(req: IncomingMessage): { path: string; query: string 
 
 // Read the whole request body into one Buffer.
 function readRequestBody(req: IncomingMessage): Promise<Buffer> {
+  // GET/HEAD never carry a body in this API, and no body is declared:
+  // resolve at once instead of waiting a turn for the stream to end.
+  if ((req.method === 'GET' || req.method === 'HEAD') && !req.headers['content-length'] && !req.headers['transfer-encoding']) {
+    return Promise.resolve(Buffer.alloc(0));
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
