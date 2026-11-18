@@ -11,6 +11,12 @@ export interface RestResult {
   headers: Record<string, string>;
 }
 
+// One shared empty query, reused whenever a request carries no query
+// string (the common case on the read hot path). No route ever mutates
+// the query it is handed — paginate copies it before setting page
+// values — so sharing it is safe.
+const EMPTY_QUERY = new URLSearchParams();
+
 export class RestHandler {
   store: Store;
   expectedToken: string;
@@ -65,7 +71,7 @@ export class RestHandler {
   handle(method: string, path: string, rawQuery: string, headers: Record<string, string | undefined>, bodyText: string, host: string): RestResult {
     try {
       if (!this.auth(headers)) return this.err(401, 'Requires authentication');
-      const query = new URLSearchParams(rawQuery);
+      const query = rawQuery === '' ? EMPTY_QUERY : new URLSearchParams(rawQuery);
       let body: Record<string, unknown> = {};
       if (bodyText !== '' && (method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE')) {
         try {

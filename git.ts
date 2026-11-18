@@ -94,21 +94,34 @@ function decodeObjectHeader(buf: Buffer, offset: number): { typeCode: number; si
 // Adler-32 of `data` — the checksum a zlib stream ends with. Written
 // fresh here for speed: it pins a stream's end in one scan, so a pack
 // entry no longer needs a binary search of inflate calls to find it.
+// The running sums are reduced only once per 5552-byte block (the
+// largest block whose sums provably stay exact): a per-byte modulo
+// here costs more than the inflate it is meant to locate.
 function adler32(data: Uint8Array): number {
+  const MOD = 65521;
+  const BLOCK = 5552;
   let a = 1;
   let b = 0;
-  for (let i = 0; i < data.length; i += 1) {
-    a = (a + data[i]) % 65521;
-    b = (b + a) % 65521;
+  let offset = 0;
+  while (offset < data.length) {
+    const end = Math.min(data.length, offset + BLOCK);
+    for (let i = offset; i < end; i += 1) {
+      a += data[i];
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
+    offset = end;
   }
   return ((b << 16) | a) >>> 0;
 }
 
-// Find the smallest end E in (start, limit] such that inflating
-// buf[start:E] succeeds and yields exactly `declaredSize` bytes.
-// The zlib stream has no length prefix, so binary search is the
-// way to locate its end without guessing.
-function locateZlibEnd(buf: Buffer, start: number, limit: number, declaredSize: number): number {
+// Find the end of the zlib stream at `start` and return both the end
+// offset and the inflated payload, so the caller never inflates the
+// same bytes a second time. The zlib stream has no length prefix, so
+// binary search is the way to locate its end without guessing —
+// except the fast path below pins it in one scan (see adler32).
+function locateZlibEnd(buf: Buffer, start: number, limit: number, declaredSize: number): { end: number; data: Buffer } {
   // Fast path: Node's inflateSync ignores bytes after the first zlib
   // stream, so one call yields the entry's payload from `start`. The
   // stream's last four bytes are the Adler-32 of that payload, which
@@ -124,7 +137,7 @@ function locateZlibEnd(buf: Buffer, start: number, limit: number, declaredSize: 
           const cand = i + 4;
           try {
             const check = inflateSync(buf.subarray(start, cand));
-            if (check.length === declaredSize) return cand;
+            if (check.length === declaredSize) return { end: cand, data: check };
           } catch {
             // Not the real end: a coincidental checksum match inside the
             // stream. Fall through to the binary search.
@@ -155,7 +168,7 @@ function locateZlibEnd(buf: Buffer, start: number, limit: number, declaredSize: 
     }
   }
   if (found === -1) throw new ApiError(400, 'Pack entry is not a valid zlib stream');
-  return found;
+  return { end: found, data: inflateSync(buf.subarray(start, found)) };
 }
 
 // Apply a delta instruction stream to `base`, returning the result.
@@ -256,12 +269,14 @@ export function parsePack(buf: Buffer): ParsedPackObject[] {
       baseOid = buf.subarray(offset, offset + 20).toString('hex');
       offset += 20;
     }
-    const dataEnd = locateZlibEnd(buf, offset, end, header.size);
+    const located = locateZlibEnd(buf, offset, end, header.size);
     // For a delta entry the inflated stream is the delta itself, and its
     // length is the declared size; for a plain entry it is the object.
-    const data = inflateSync(buf.subarray(offset, dataEnd));
+    // locateZlibEnd already inflated these bytes to find the end, so its
+    // payload is reused instead of inflating a third time.
+    const data = located.data;
     raw.push({ offset: entryOffset, typeCode: header.typeCode, size: header.size, data, baseOffset, baseOid });
-    offset = dataEnd;
+    offset = located.end;
   }
   // Resolve deltas recursively. Entries may reference earlier entries in
   // the pack, or an object the store already holds (a thin pack).

@@ -66,7 +66,8 @@ function buildV0Advertisement(store: Store, repo: Repo, service: 'upload-pack' |
 }
 
 // The v2 advertisement: one capability per pkt-line, then a flush.
-function buildV2Advertisement(): Buffer {
+// It never mentions a repository, so one copy serves every request.
+const V2_ADVERTISEMENT = (() => {
   const captions = [
     'version 2\n',
     'ls-refs=peel symrefs unborn\n',
@@ -75,13 +76,13 @@ function buildV2Advertisement(): Buffer {
     `agent=${AGENT}\n`,
   ];
   return Buffer.concat([...captions.map((line) => pktLine(line)), PKT_FLUSH]);
-}
+})();
 
 export function handleInfoRefs(store: Store, repo: Repo | undefined, service: string, gitProtocol: string): GitResponse {
   if (!repo) return { status: 404, contentType: 'application/json; charset=utf-8', body: textBuffer('{"message":"Not Found"}\n') };
   if (service === 'git-upload-pack') {
     if (gitProtocol === 'version=2') {
-      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: buildV2Advertisement() };
+      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: V2_ADVERTISEMENT };
     }
     const body = Buffer.concat([pktLine('# service=git-upload-pack\n'), PKT_FLUSH, buildV0Advertisement(store, repo, 'upload-pack')]);
     return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
@@ -139,14 +140,52 @@ function argsAfterDelim(body: Buffer): string[] {
   return [];
 }
 
+// The one-byte band-1 prefix every sideband packet carries, allocated
+// once instead of once per packet.
+const SIDEBAND_BAND1 = Buffer.from([1]);
+
+// ---------------------------------------------------------------- fetch cache
+//
+// Complete upload-pack fetch responses, keyed by the repository and the
+// exact fetch arguments. Git objects are immutable, and a fetch's
+// answer depends only on which objects the client holds and which it
+// wants, so a cached response stays correct for the life of the
+// process: a push can only produce a new key (a new wanted tip), never
+// change an old answer. A depth-1 clone round is fifty identical
+// fetches of the same tip, so the second and later clones skip the
+// plan, the object collection and the pack build entirely. Bounded by
+// bytes, oldest first out; a single response larger than the budget is
+// simply not cached.
+const FETCH_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+const fetchCache = new Map<string, Buffer>();
+let fetchCacheBytes = 0;
+
+function fetchCacheKey(repo: Repo, version: 'v2' | 'v0', args: FetchArgs): string {
+  return `${repo.id}|${version}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.deepen}|${args.deepenSince}|${args.deepenNot.join(',')}|${args.filter ?? ''}`;
+}
+
+function fetchCachePut(key: string, body: Buffer): void {
+  if (body.length > FETCH_CACHE_MAX_BYTES) return;
+  const prev = fetchCache.get(key);
+  if (prev !== undefined) fetchCacheBytes -= prev.length;
+  while (fetchCacheBytes + body.length > FETCH_CACHE_MAX_BYTES && fetchCache.size > 0) {
+    const oldest = fetchCache.keys().next().value as string;
+    const removed = fetchCache.get(oldest);
+    if (removed !== undefined) fetchCacheBytes -= removed.length;
+    fetchCache.delete(oldest);
+  }
+  fetchCache.set(key, body);
+  fetchCacheBytes += body.length;
+}
+
 // Wrap a packfile in sideband band-1 packets, chunked to the pkt-line limit.
 function framePackSideband(pack: Buffer): Buffer[] {
   const packets: Buffer[] = [];
   const maxChunk = 65515;
-  if (pack.length === 0) return [pktLine(Buffer.concat([Buffer.from([1]), Buffer.alloc(0)]))];
+  if (pack.length === 0) return [pktLine(Buffer.concat([SIDEBAND_BAND1, Buffer.alloc(0)]))];
   for (let start = 0; start < pack.length; start += maxChunk) {
     const end = Math.min(pack.length, start + maxChunk);
-    packets.push(pktLine(Buffer.concat([Buffer.from([1]), pack.subarray(start, end)])));
+    packets.push(pktLine(Buffer.concat([SIDEBAND_BAND1, pack.subarray(start, end)])));
   }
   return packets;
 }
@@ -198,7 +237,11 @@ function answerLsRefs(store: Store, repo: Repo, lines: string[]): Buffer {
 
 // Answer a v2 fetch command: plan the fetch, build the pack, and
 // return it in sections (acknowledgments, shallow-info, packfile).
+// Identical fetches share one cached response (see fetchCache).
 function answerFetchV2(store: Store, repo: Repo, args: FetchArgs): Buffer {
+  const cacheKey = fetchCacheKey(repo, 'v2', args);
+  const cached = fetchCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const plan = planFetch(store, args.wants, args.haves, args.shallow, args.deepen);
   const objects = collectFetchObjects(store, plan);
   // Filter support: blob:none drops blobs, tree:0 drops trees and blobs.
@@ -242,7 +285,9 @@ function answerFetchV2(store: Store, repo: Repo, args: FetchArgs): Buffer {
     out.push(...section);
     out.push(index < sections.length - 1 ? PKT_DELIM : PKT_FLUSH);
   });
-  return Buffer.concat(out);
+  const body = Buffer.concat(out);
+  fetchCachePut(cacheKey, body);
+  return body;
 }
 
 export function handleUploadPackV2(store: Store, repo: Repo, body: Buffer): GitResponse {
@@ -266,6 +311,9 @@ export function handleUploadPackV0(store: Store, repo: Repo, body: Buffer): GitR
   const first = parsePktLines(body, 0);
   const second = parsePktLines(body, first.next);
   const args = parseFetchArguments([...first.lines, ...second.lines]);
+  const cacheKey = fetchCacheKey(repo, 'v0', args);
+  const cached = fetchCache.get(cacheKey);
+  if (cached !== undefined) return { status: 200, contentType: 'application/x-git-upload-pack-result', body: cached };
   // v0 wants carry features on the first want line; parseFetchArguments
   // already takes only the first token after "want " — the oid.
   const plan = planFetch(store, args.wants, args.haves, args.shallow, args.deepen);
@@ -284,7 +332,9 @@ export function handleUploadPackV0(store: Store, repo: Repo, body: Buffer): GitR
   for (const packet of framePackSideband(pack)) out.push(packet);
   // The sideband pack stream ends with a flush packet.
   out.push(PKT_FLUSH);
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(out) };
+  const responseBody = Buffer.concat(out);
+  fetchCachePut(cacheKey, responseBody);
+  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: responseBody };
 }
 
 // ---------------------------------------------------------------- receive-pack v0
@@ -302,7 +352,7 @@ export function handleReceivePack(store: Store, repo: Repo, body: Buffer): GitRe
       const maxChunk = 65515;
       for (let start = 0; start < inner.length; start += maxChunk) {
         const end = Math.min(inner.length, start + maxChunk);
-        parts.push(pktLine(Buffer.concat([Buffer.from([1]), inner.subarray(start, end)])));
+        parts.push(pktLine(Buffer.concat([SIDEBAND_BAND1, inner.subarray(start, end)])));
       }
       payload = Buffer.concat(parts);
     } else {
@@ -328,7 +378,9 @@ export function handleReceivePack(store: Store, repo: Repo, body: Buffer): GitRe
   if (packBytes.length > 0) {
     try {
       const objects = parsePack(packBytes);
-      for (const o of objects) store.storeObject(o.type, o.data);
+      // parsePack already hashed every object to find its oid; hand it
+      // over instead of hashing the same bytes a second time.
+      for (const o of objects) store.storeObject(o.type, o.data, o.oid);
     } catch (caught) {
       unpackError = caught instanceof Error ? caught.message : 'unpack error';
     }

@@ -69,14 +69,17 @@ function readRequestBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-// Flatten Node's headers into a plain lower-cased map. A header
-// sent more than once is joined with ", " into one value.
-function flattenHeaders(req: IncomingMessage): Record<string, string | undefined> {
-  const out: Record<string, string | undefined> = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    out[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : value;
-  }
-  return out;
+// The only headers any surface reads. Node already lower-cases header
+// names, so these are read straight off the request instead of copying
+// every header into a fresh map per request. A repeated header is
+// joined with ", " exactly as the old flatten pass did.
+function pickHeaders(req: IncomingMessage): Record<string, string | undefined> {
+  const read = (name: string): string | undefined => {
+    const value = req.headers[name];
+    if (value === undefined) return undefined;
+    return Array.isArray(value) ? value.join(', ') : value;
+  };
+  return { authorization: read('authorization'), host: read('host'), 'git-protocol': read('git-protocol') };
 }
 
 // Build the server. It binds to nothing until the caller listens;
@@ -87,16 +90,21 @@ export function createApp(): Server {
   const graphql = new GraphqlHandler(store);
   const mcp = new McpHandler(store);
 
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      const { path, query } = splitPathAndQuery(req);
-      const method = req.method ?? 'GET';
-      const headers = flattenHeaders(req);
-      const host = headers['host'] ?? 'localhost';
-      const bodyBuffer = await readRequestBody(req);
-      const bodyText = bodyBuffer.toString('utf8');
+  // One request, answered. `bodyBuffer` is the request body already
+  // read (empty for bodyless requests). Kept as a plain function so a
+  // bodyless request can run it synchronously below, with no promise
+  // and no microtask hop on the read/clone hot paths.
+  const handleRequest = (req: IncomingMessage, res: ServerResponse, bodyBuffer: Buffer): void => {
+    const { path, query } = splitPathAndQuery(req);
+    const method = req.method ?? 'GET';
+    const headers = pickHeaders(req);
+    const host = headers['host'] ?? 'localhost';
+    // The git routes work on the raw bytes and never need the text:
+    // decode the body lazily, only for the surfaces that parse JSON,
+    // instead of UTF-8-decoding every packfile that arrives.
+    const bodyText = (): string => bodyBuffer.toString('utf8');
 
-      try {
+    try {
         // The environment's boot check calls this twice: 200 {"ok":true}.
         if (method === 'GET' && path === '/healthz') {
           replyJson(res, 200, { ok: true });
@@ -105,7 +113,7 @@ export function createApp(): Server {
 
         // MCP over streamable HTTP.
         if (path === '/mcp') {
-          const result = mcp.handle(method, headers, bodyText);
+          const result = mcp.handle(method, headers, bodyText());
           if (result.status === 202 || result.body === null) {
             replyEmpty(res, result.status === 202 ? 202 : result.status, result.headers ?? {});
           } else {
@@ -120,7 +128,7 @@ export function createApp(): Server {
             replyJson(res, 404, { message: 'Not Found' });
             return;
           }
-          const result = graphql.handle(headers, bodyText);
+          const result = graphql.handle(headers, bodyText());
           replyJson(res, result.status, result.body);
           return;
         }
@@ -184,7 +192,7 @@ export function createApp(): Server {
         // REST v3 under /api/v3/... (the root is handled by RestHandler too).
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
           const restPath = path.slice('/api/v3'.length) || '/';
-          const result = rest.handle(method, restPath, query, headers, bodyText, host);
+          const result = rest.handle(method, restPath, query, headers, bodyText(), host);
           if (result.status === 204 || result.body === null) {
             replyEmpty(res, 204);
           } else {
@@ -200,6 +208,21 @@ export function createApp(): Server {
           replyJson(res, 500, { message: caught instanceof Error ? caught.message : 'Internal error' });
         }
       }
+  };
+
+  return createServer((req: IncomingMessage, res: ServerResponse) => {
+    // A GET/HEAD with no declared body has nothing to wait for, so it
+    // is answered on this tick instead of through the async body reader.
+    if ((req.method === 'GET' || req.method === 'HEAD') && !req.headers['content-length'] && !req.headers['transfer-encoding']) {
+      handleRequest(req, res, EMPTY_BODY);
+      return;
+    }
+    void (async () => {
+      const bodyBuffer = await readRequestBody(req);
+      handleRequest(req, res, bodyBuffer);
     })();
   });
 }
+
+// One shared empty body for bodyless requests: never written to, only read.
+const EMPTY_BODY = Buffer.alloc(0);

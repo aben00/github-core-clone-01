@@ -220,8 +220,11 @@ export class Store {
   }
 
   // ---- git objects ---------------------------------------------------
-  storeObject(type: GitObject['type'], data: Buffer): string {
-    const oid = gitObjectId(type, data);
+  // Store an object, skipping the re-hash when the caller already knows
+  // the oid (a pack parser hashes every object it reads; re-hashing the
+  // same bytes on store is pure overhead on the push hot path).
+  storeObject(type: GitObject['type'], data: Buffer, knownOid?: string): string {
+    const oid = knownOid ?? gitObjectId(type, data);
     if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
     return oid;
   }
@@ -260,9 +263,27 @@ export class Store {
     return chain;
   }
 
+  // True when `maybeAncestor` is `oid` or one of its ancestors. Walks
+  // out from `oid` and stops the moment the ancestor is found, instead
+  // of building the tip's whole chain first: a fast-forward push's new
+  // tip has the old tip as its direct parent, so the common case is one
+  // step, not a walk of the entire history.
   isAncestor(maybeAncestor: string, oid: string): boolean {
     if (maybeAncestor === oid) return true;
-    return this.commitChain(oid).includes(maybeAncestor);
+    const visited = new Set<string>();
+    const pending: string[] = [oid];
+    while (pending.length > 0) {
+      const current = pending.pop() as string;
+      if (visited.has(current)) continue;
+      visited.add(current);
+      const parsed = this.commitOf(current);
+      if (!parsed) continue;
+      for (const parent of parsed.parents) {
+        if (parent === maybeAncestor) return true;
+        pending.push(parent);
+      }
+    }
+    return false;
   }
 
   // Objects a client that already holds `tips` already has: the tips
